@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 APP_NAME = "momotarou Bridge"
-APP_VERSION = "0.5.2"
-POSTING_NAME = "momotarou(AI)"
+APP_VERSION = "0.6.0"
+DEFAULT_POSTING_NAME = "無名(AI)"
 WRITER_WEBHOOK_NAME = "momotarou Bridge Writer"
 MCP_PUBLIC_HOST = "momo-bridge-server-test.onrender.com"
 
@@ -41,6 +41,25 @@ def parse_channel_ids(raw: str) -> tuple[set[int], list[str]]:
         else:
             invalid.append(value)
     return ids, invalid
+
+
+def normalize_posting_name(posting_name: str | None) -> str:
+    if not posting_name or not posting_name.strip():
+        return DEFAULT_POSTING_NAME
+
+    base = " ".join(posting_name.replace("\r", " ").replace("\n", " ").split()).strip()
+    if not base:
+        return DEFAULT_POSTING_NAME
+
+    if base.endswith("(AI)"):
+        base = base[:-4].rstrip()
+    if not base:
+        return DEFAULT_POSTING_NAME
+
+    base = base[:76].rstrip()
+    if not base:
+        return DEFAULT_POSTING_NAME
+    return f"{base}(AI)"
 
 
 ALLOWED_CHANNEL_IDS, INVALID_CHANNEL_IDS = parse_channel_ids(DISCORD_ALLOWED_CHANNEL_IDS_RAW)
@@ -77,6 +96,7 @@ WRITE_CREATE = ToolAnnotations(
 class SendMessageRequest(BaseModel):
     channel_id: str = Field(min_length=1, max_length=30)
     content: str = Field(min_length=1, max_length=2000)
+    posting_name: str | None = Field(default=None, max_length=200)
 
 
 @discord_client.event
@@ -87,7 +107,7 @@ async def on_ready():
     )
     print(f"Discord read allowlist contains {len(ALLOWED_CHANNEL_IDS)} channel(s).")
     print(f"Discord write allowlist contains {len(ALLOWED_WRITE_CHANNEL_IDS)} channel(s).")
-    print(f"Discord posting name: {POSTING_NAME}")
+    print(f"Discord default posting name: {DEFAULT_POSTING_NAME}")
     if BRIDGE_API_KEY:
         print("MCP endpoint configured with a private derived route token.")
 
@@ -124,7 +144,8 @@ def discord_status() -> dict:
             "allowed_channel_count": len(ALLOWED_WRITE_CHANNEL_IDS),
             "allowlist_valid": not INVALID_WRITE_CHANNEL_IDS,
             "allowlist_source": "read_allowlist" if write_allowlist_inherited else "write_allowlist",
-            "posting_name": POSTING_NAME,
+            "custom_posting_name_supported": True,
+            "default_posting_name": DEFAULT_POSTING_NAME,
             "manage_webhooks_required": True,
         },
     }
@@ -212,7 +233,7 @@ async def get_write_channel(channel_id: int) -> discord.TextChannel:
     if not isinstance(channel, discord.TextChannel):
         raise HTTPException(
             status_code=400,
-            detail="v0.5 posting supports Discord text channels only",
+            detail="v0.6 posting supports Discord text channels only",
         )
     return channel
 
@@ -362,7 +383,7 @@ async def get_writer_webhook(channel: discord.TextChannel) -> discord.Webhook:
     try:
         webhook = await channel.create_webhook(
             name=WRITER_WEBHOOK_NAME,
-            reason="momotarou Bridge v0.5 posting webhook",
+            reason="momotarou Bridge v0.6 posting webhook",
         )
     except discord.Forbidden as exc:
         raise HTTPException(
@@ -382,19 +403,24 @@ async def get_writer_webhook(channel: discord.TextChannel) -> discord.Webhook:
     return webhook
 
 
-async def send_message_impl(channel_id: int, content: str) -> dict:
+async def send_message_impl(
+    channel_id: int,
+    content: str,
+    posting_name: str | None = None,
+) -> dict:
     if not content or not content.strip():
         raise HTTPException(status_code=400, detail="Message content cannot be empty")
     if len(content) > 2000:
         raise HTTPException(status_code=400, detail="Message content must be 2000 characters or fewer")
 
+    resolved_posting_name = normalize_posting_name(posting_name)
     channel = await get_write_channel(channel_id)
     webhook = await get_writer_webhook(channel)
 
     try:
         message = await webhook.send(
             content,
-            username=POSTING_NAME,
+            username=resolved_posting_name,
             allowed_mentions=discord.AllowedMentions.none(),
             wait=True,
         )
@@ -418,7 +444,7 @@ async def send_message_impl(channel_id: int, content: str) -> dict:
 
     return {
         "ok": True,
-        "posting_name": POSTING_NAME,
+        "posting_name": resolved_posting_name,
         "channel": serialize_channel(channel),
         "message": serialize_message(message),
     }
@@ -520,15 +546,19 @@ async def search_discord_messages(
 
 
 @mcp.tool(annotations=WRITE_CREATE)
-async def send_discord_message(channel_id: str, content: str) -> dict:
-    """Create one new plain-text Discord message as momotarou(AI) in a write-allowlisted text channel. Mentions are disabled."""
+async def send_discord_message(
+    channel_id: str,
+    content: str,
+    posting_name: str | None = None,
+) -> dict:
+    """Create one new plain-text Discord message in a write-allowlisted channel. Set posting_name to choose the displayed name; '(AI)' is appended automatically. If omitted, the displayed name is 無名(AI). Mentions are disabled."""
     if not channel_id.isdigit():
         raise ValueError("channel_id must be a Discord numeric ID")
     if not content or not content.strip():
         raise ValueError("content cannot be empty")
     if len(content) > 2000:
         raise ValueError("content must be 2000 characters or fewer")
-    return await send_message_impl(int(channel_id), content)
+    return await send_message_impl(int(channel_id), content, posting_name)
 
 
 mcp_http_app = mcp.streamable_http_app(
@@ -624,13 +654,13 @@ p{{line-height:1.8}}
 <div class="card">
 <span class="ok">{badge}</span>
 <h1>{APP_NAME}</h1>
-<p>許可したDiscordチャンネルを読み取り、許可したチャンネルへ momotarou(AI) 名義で投稿するMCP対応版です。</p>
+<p>許可したDiscordチャンネルを読み取り、許可したチャンネルへ任意の名前 + (AI) で投稿できるMCP対応版です。</p>
 <p><b>Version:</b> {APP_VERSION}</p>
 <p><b>UTC:</b> {now}</p>
 <p><b>Discord:</b> {state}</p>
 <p><b>Reader:</b> {reader_state} ({reader["allowed_channel_count"]} channels)</p>
 <p><b>Writer:</b> {writer_state} ({writer["allowed_channel_count"]} channels)</p>
-<p><b>Posting name:</b> {POSTING_NAME}</p>
+<p><b>Default posting name:</b> {DEFAULT_POSTING_NAME}</p>
 <p><b>MCP:</b> {"Configured" if reader["mcp_configured"] else "Not configured"}</p>
 <p><b>Status API:</b> <code>/discord/status</code></p>
 <p><b>Health:</b> <code>/health</code></p>
@@ -663,7 +693,7 @@ async def get_mcp_info(
 ):
     base_url = str(request.base_url).rstrip("/")
     return {
-        "name": "momotarou Bridge",
+        "name": APP_NAME,
         "version": APP_VERSION,
         "transport": "streamable-http",
         "server_url": f"{base_url}{MCP_MOUNT_PATH}/",
@@ -705,7 +735,7 @@ async def send_message_rest(
 ):
     if not body.channel_id.isdigit():
         raise HTTPException(status_code=400, detail="channel_id must be a Discord numeric ID")
-    return await send_message_impl(int(body.channel_id), body.content)
+    return await send_message_impl(int(body.channel_id), body.content, body.posting_name)
 
 
 app.mount(MCP_MOUNT_PATH, mcp_http_app)
