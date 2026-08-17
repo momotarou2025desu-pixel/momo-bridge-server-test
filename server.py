@@ -1,18 +1,38 @@
 import asyncio
 import os
+import secrets
 from datetime import datetime, timezone
 
 import discord
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-APP_NAME = "momo Bridge Server Discord Test"
-APP_VERSION = "0.2.0"
+APP_NAME = "momo Bridge Server Discord Reader"
+APP_VERSION = "0.3.0"
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
+DISCORD_ALLOWED_CHANNEL_IDS_RAW = os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS", "").strip()
+
+
+def parse_channel_ids(raw: str) -> tuple[set[int], list[str]]:
+    ids: set[int] = set()
+    invalid: list[str] = []
+    for item in raw.replace("\n", ",").split(","):
+        value = item.strip()
+        if not value:
+            continue
+        if value.isdigit():
+            ids.add(int(value))
+        else:
+            invalid.append(value)
+    return ids, invalid
+
+
+ALLOWED_CHANNEL_IDS, INVALID_CHANNEL_IDS = parse_channel_ids(DISCORD_ALLOWED_CHANNEL_IDS_RAW)
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -23,7 +43,11 @@ discord_task: asyncio.Task | None = None
 
 @discord_client.event
 async def on_ready():
-    print(f"Discord connected as {discord_client.user} ({discord_client.user.id if discord_client.user else 'unknown'})")
+    print(
+        f"Discord connected as {discord_client.user} "
+        f"({discord_client.user.id if discord_client.user else 'unknown'})"
+    )
+    print(f"Discord Reader allowlist contains {len(ALLOWED_CHANNEL_IDS)} channel(s).")
 
 
 async def start_discord_client():
@@ -40,6 +64,8 @@ async def start_discord_client():
 @app.on_event("startup")
 async def startup_event():
     global discord_task
+    if INVALID_CHANNEL_IDS:
+        print(f"Ignoring invalid DISCORD_ALLOWED_CHANNEL_IDS values: {INVALID_CHANNEL_IDS}")
     if DISCORD_BOT_TOKEN:
         discord_task = asyncio.create_task(start_discord_client())
 
@@ -61,6 +87,100 @@ def discord_status():
         "user": str(user) if user else None,
         "user_id": user.id if user else None,
         "guild_count": len(discord_client.guilds) if discord_client.is_ready() else 0,
+        "reader": {
+            "api_key_configured": bool(BRIDGE_API_KEY),
+            "allowed_channel_count": len(ALLOWED_CHANNEL_IDS),
+            "allowlist_valid": not INVALID_CHANNEL_IDS,
+        },
+    }
+
+
+async def require_bridge_key(
+    x_bridge_key: str | None = Header(default=None, alias="X-Bridge-Key"),
+) -> None:
+    if not BRIDGE_API_KEY:
+        raise HTTPException(status_code=503, detail="BRIDGE_API_KEY is not configured")
+    if not x_bridge_key:
+        raise HTTPException(status_code=401, detail="X-Bridge-Key header is required")
+    if not secrets.compare_digest(x_bridge_key, BRIDGE_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid bridge API key")
+
+
+def ensure_reader_ready() -> None:
+    if not DISCORD_BOT_TOKEN:
+        raise HTTPException(status_code=503, detail="DISCORD_BOT_TOKEN is not configured")
+    if not discord_client.is_ready():
+        raise HTTPException(status_code=503, detail="Discord client is not connected")
+    if not ALLOWED_CHANNEL_IDS:
+        raise HTTPException(
+            status_code=503,
+            detail="DISCORD_ALLOWED_CHANNEL_IDS is not configured",
+        )
+
+
+def ensure_channel_allowed(channel_id: int) -> None:
+    if channel_id not in ALLOWED_CHANNEL_IDS:
+        raise HTTPException(status_code=403, detail="Channel is not in the allowlist")
+
+
+async def get_allowed_channel(channel_id: int):
+    ensure_reader_ready()
+    ensure_channel_allowed(channel_id)
+
+    channel = discord_client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await discord_client.fetch_channel(channel_id)
+        except discord.NotFound as exc:
+            raise HTTPException(status_code=404, detail="Discord channel was not found") from exc
+        except discord.Forbidden as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="Discord bot cannot access this channel",
+            ) from exc
+        except discord.HTTPException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Discord API error: {exc.status}",
+            ) from exc
+
+    if not hasattr(channel, "history"):
+        raise HTTPException(status_code=400, detail="Channel does not support message history")
+    return channel
+
+
+def serialize_message(message: discord.Message) -> dict:
+    author = message.author
+    return {
+        "id": message.id,
+        "channel_id": message.channel.id,
+        "author": str(author),
+        "author_id": author.id,
+        "content": message.content,
+        "created_at": message.created_at.isoformat(),
+        "edited_at": message.edited_at.isoformat() if message.edited_at else None,
+        "jump_url": message.jump_url,
+        "attachments": [
+            {
+                "id": attachment.id,
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "size": attachment.size,
+                "url": attachment.url,
+            }
+            for attachment in message.attachments
+        ],
+    }
+
+
+def serialize_channel(channel) -> dict:
+    guild = getattr(channel, "guild", None)
+    return {
+        "id": channel.id,
+        "name": getattr(channel, "name", None),
+        "type": str(getattr(channel, "type", "unknown")),
+        "guild_id": guild.id if guild else None,
+        "guild_name": guild.name if guild else None,
     }
 
 
@@ -68,7 +188,19 @@ def discord_status():
 async def home():
     now = datetime.now(timezone.utc).isoformat()
     status = discord_status()
-    state = "Connected" if status["connected"] else ("Configured / connecting" if status["configured"] else "Token not set")
+    state = (
+        "Connected"
+        if status["connected"]
+        else ("Configured / connecting" if status["configured"] else "Token not set")
+    )
+    reader = status["reader"]
+    reader_state = (
+        "Ready"
+        if status["connected"]
+        and reader["api_key_configured"]
+        and reader["allowed_channel_count"] > 0
+        else "Setup required"
+    )
     badge = "● Discord OK" if status["connected"] else "● Server OK"
     return f"""<!doctype html>
 <html lang="ja">
@@ -91,10 +223,12 @@ p{{line-height:1.8}}
 <div class="card">
 <span class="ok">{badge}</span>
 <h1>{APP_NAME}</h1>
-<p>Render上のHTTPSサーバーからDiscord Botへ接続できるかを確認するテスト版です。</p>
+<p>許可したDiscordチャンネルだけを読み取るテスト版です。</p>
 <p><b>Version:</b> {APP_VERSION}</p>
 <p><b>UTC:</b> {now}</p>
 <p><b>Discord:</b> {state}</p>
+<p><b>Reader:</b> {reader_state}</p>
+<p><b>Allowed channels:</b> {reader["allowed_channel_count"]}</p>
 <p><b>Status API:</b> <code>/discord/status</code></p>
 <p><b>Health:</b> <code>/health</code></p>
 </div>
@@ -117,6 +251,103 @@ async def health():
 @app.get("/discord/status")
 async def get_discord_status():
     return discord_status()
+
+
+@app.get("/discord/channels")
+async def get_allowed_channels(_: None = Depends(require_bridge_key)):
+    ensure_reader_ready()
+    channels = []
+    for channel_id in sorted(ALLOWED_CHANNEL_IDS):
+        try:
+            channel = await get_allowed_channel(channel_id)
+            channels.append({"ok": True, **serialize_channel(channel)})
+        except HTTPException as exc:
+            channels.append(
+                {
+                    "ok": False,
+                    "id": channel_id,
+                    "status_code": exc.status_code,
+                    "error": exc.detail,
+                }
+            )
+    return {"channels": channels}
+
+
+@app.get("/discord/messages/{channel_id}")
+async def get_messages(
+    channel_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    before: int | None = Query(default=None, ge=1),
+    _: None = Depends(require_bridge_key),
+):
+    channel = await get_allowed_channel(channel_id)
+    before_object = discord.Object(id=before) if before else None
+
+    try:
+        messages = [
+            serialize_message(message)
+            async for message in channel.history(
+                limit=limit,
+                before=before_object,
+                oldest_first=False,
+            )
+        ]
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot lacks permission to read message history",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error: {exc.status}",
+        ) from exc
+
+    return {
+        "channel": serialize_channel(channel),
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+@app.get("/discord/search/{channel_id}")
+async def search_messages(
+    channel_id: int,
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=20, ge=1, le=50),
+    scan_limit: int = Query(default=200, ge=1, le=500),
+    _: None = Depends(require_bridge_key),
+):
+    channel = await get_allowed_channel(channel_id)
+    needle = q.casefold()
+    matches = []
+    scanned = 0
+
+    try:
+        async for message in channel.history(limit=scan_limit, oldest_first=False):
+            scanned += 1
+            if needle in message.content.casefold():
+                matches.append(serialize_message(message))
+                if len(matches) >= limit:
+                    break
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot lacks permission to read message history",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error: {exc.status}",
+        ) from exc
+
+    return {
+        "channel": serialize_channel(channel),
+        "query": q,
+        "scanned": scanned,
+        "count": len(matches),
+        "messages": matches,
+    }
 
 
 if __name__ == "__main__":
