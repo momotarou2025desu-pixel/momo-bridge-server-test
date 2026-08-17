@@ -1,17 +1,19 @@
 import asyncio
+import contextlib
+import hashlib
 import os
 import secrets
 from datetime import datetime, timezone
 
 import discord
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
+from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
 import uvicorn
 
 APP_NAME = "momo Bridge Server Discord Reader"
-APP_VERSION = "0.3.0"
-
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+APP_VERSION = "0.4.0"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
@@ -33,12 +35,25 @@ def parse_channel_ids(raw: str) -> tuple[set[int], list[str]]:
 
 
 ALLOWED_CHANNEL_IDS, INVALID_CHANNEL_IDS = parse_channel_ids(DISCORD_ALLOWED_CHANNEL_IDS_RAW)
+MCP_ROUTE_TOKEN = (
+    hashlib.sha256(BRIDGE_API_KEY.encode("utf-8")).hexdigest()[:32]
+    if BRIDGE_API_KEY
+    else "not-configured"
+)
+MCP_MOUNT_PATH = f"/mcp/{MCP_ROUTE_TOKEN}"
 
 intents = discord.Intents.none()
 intents.guilds = True
 
 discord_client = discord.Client(intents=intents)
 discord_task: asyncio.Task | None = None
+
+mcp = MCPServer("momo Discord Reader")
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+)
 
 
 @discord_client.event
@@ -48,6 +63,8 @@ async def on_ready():
         f"({discord_client.user.id if discord_client.user else 'unknown'})"
     )
     print(f"Discord Reader allowlist contains {len(ALLOWED_CHANNEL_IDS)} channel(s).")
+    if BRIDGE_API_KEY:
+        print("MCP endpoint configured with a private derived route token.")
 
 
 async def start_discord_client():
@@ -61,25 +78,7 @@ async def start_discord_client():
         print(f"Discord connection failed: {type(exc).__name__}: {exc}")
 
 
-@app.on_event("startup")
-async def startup_event():
-    global discord_task
-    if INVALID_CHANNEL_IDS:
-        print(f"Ignoring invalid DISCORD_ALLOWED_CHANNEL_IDS values: {INVALID_CHANNEL_IDS}")
-    if DISCORD_BOT_TOKEN:
-        discord_task = asyncio.create_task(start_discord_client())
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global discord_task
-    if not discord_client.is_closed():
-        await discord_client.close()
-    if discord_task and not discord_task.done():
-        discord_task.cancel()
-
-
-def discord_status():
+def discord_status() -> dict:
     user = discord_client.user
     return {
         "configured": bool(DISCORD_BOT_TOKEN),
@@ -91,6 +90,7 @@ def discord_status():
             "api_key_configured": bool(BRIDGE_API_KEY),
             "allowed_channel_count": len(ALLOWED_CHANNEL_IDS),
             "allowlist_valid": not INVALID_CHANNEL_IDS,
+            "mcp_configured": bool(BRIDGE_API_KEY),
         },
     }
 
@@ -152,17 +152,17 @@ async def get_allowed_channel(channel_id: int):
 def serialize_message(message: discord.Message) -> dict:
     author = message.author
     return {
-        "id": message.id,
-        "channel_id": message.channel.id,
+        "id": str(message.id),
+        "channel_id": str(message.channel.id),
         "author": str(author),
-        "author_id": author.id,
+        "author_id": str(author.id),
         "content": message.content,
         "created_at": message.created_at.isoformat(),
         "edited_at": message.edited_at.isoformat() if message.edited_at else None,
         "jump_url": message.jump_url,
         "attachments": [
             {
-                "id": attachment.id,
+                "id": str(attachment.id),
                 "filename": attachment.filename,
                 "content_type": attachment.content_type,
                 "size": attachment.size,
@@ -176,12 +176,213 @@ def serialize_message(message: discord.Message) -> dict:
 def serialize_channel(channel) -> dict:
     guild = getattr(channel, "guild", None)
     return {
-        "id": channel.id,
+        "id": str(channel.id),
         "name": getattr(channel, "name", None),
         "type": str(getattr(channel, "type", "unknown")),
-        "guild_id": guild.id if guild else None,
+        "guild_id": str(guild.id) if guild else None,
         "guild_name": guild.name if guild else None,
     }
+
+
+async def read_messages_impl(
+    channel_id: int,
+    limit: int = 20,
+    before: int | None = None,
+    after: int | None = None,
+) -> dict:
+    if before and after:
+        raise HTTPException(status_code=400, detail="Use before or after, not both")
+    channel = await get_allowed_channel(channel_id)
+    before_object = discord.Object(id=before) if before else None
+    after_object = discord.Object(id=after) if after else None
+
+    try:
+        messages = [
+            serialize_message(message)
+            async for message in channel.history(
+                limit=limit,
+                before=before_object,
+                after=after_object,
+                oldest_first=False,
+            )
+        ]
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot lacks permission to read message history",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error: {exc.status}",
+        ) from exc
+
+    return {
+        "channel": serialize_channel(channel),
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+async def search_messages_impl(
+    channel_id: int,
+    query: str,
+    limit: int = 20,
+    scan_limit: int = 200,
+) -> dict:
+    channel = await get_allowed_channel(channel_id)
+    needle = query.casefold()
+    matches = []
+    scanned = 0
+
+    try:
+        async for message in channel.history(limit=scan_limit, oldest_first=False):
+            scanned += 1
+            if needle in message.content.casefold():
+                matches.append(serialize_message(message))
+                if len(matches) >= limit:
+                    break
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot lacks permission to read message history",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error: {exc.status}",
+        ) from exc
+
+    return {
+        "channel": serialize_channel(channel),
+        "query": query,
+        "scanned": scanned,
+        "count": len(matches),
+        "messages": matches,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def discord_status_tool() -> dict:
+    """Verify Discord connectivity and show Reader configuration status without exposing secrets."""
+    return discord_status()
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def list_allowed_channels() -> dict:
+    """List only the Discord channels explicitly allowlisted for this Reader."""
+    ensure_reader_ready()
+    channels = []
+    for channel_id in sorted(ALLOWED_CHANNEL_IDS):
+        try:
+            channel = await get_allowed_channel(channel_id)
+            channels.append({"ok": True, **serialize_channel(channel)})
+        except HTTPException as exc:
+            channels.append(
+                {
+                    "ok": False,
+                    "id": str(channel_id),
+                    "status_code": exc.status_code,
+                    "error": exc.detail,
+                }
+            )
+    return {"channels": channels}
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def read_channel_messages(
+    channel_id: str,
+    limit: int = 50,
+    before: str | None = None,
+    after: str | None = None,
+) -> dict:
+    """Read recent message history from one allowlisted Discord channel. Newest messages are returned first."""
+    if not channel_id.isdigit():
+        raise ValueError("channel_id must be a Discord numeric ID")
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
+    before_id = int(before) if before and before.isdigit() else None
+    after_id = int(after) if after and after.isdigit() else None
+    if before and before_id is None:
+        raise ValueError("before must be a Discord numeric message ID")
+    if after and after_id is None:
+        raise ValueError("after must be a Discord numeric message ID")
+    return await read_messages_impl(int(channel_id), limit, before_id, after_id)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_discord_message(channel_id: str, message_id: str) -> dict:
+    """Fetch one Discord message by ID from an allowlisted channel."""
+    if not channel_id.isdigit() or not message_id.isdigit():
+        raise ValueError("channel_id and message_id must be Discord numeric IDs")
+    channel = await get_allowed_channel(int(channel_id))
+    try:
+        message = await channel.fetch_message(int(message_id))
+    except discord.NotFound as exc:
+        raise ValueError("Discord message was not found") from exc
+    except discord.Forbidden as exc:
+        raise ValueError("Discord bot cannot access this message") from exc
+    except discord.HTTPException as exc:
+        raise ValueError(f"Discord API error: {exc.status}") from exc
+    return serialize_message(message)
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def search_discord_messages(
+    query: str,
+    channel_ids: list[str] | None = None,
+    limit: int = 25,
+) -> dict:
+    """Search message content only within allowlisted Discord channels."""
+    if not query or len(query) > 200:
+        raise ValueError("query must contain 1 to 200 characters")
+    if limit < 1 or limit > 25:
+        raise ValueError("limit must be between 1 and 25")
+
+    requested = channel_ids or [str(cid) for cid in sorted(ALLOWED_CHANNEL_IDS)]
+    results = []
+    for raw_channel_id in requested:
+        if not raw_channel_id.isdigit():
+            raise ValueError("channel_ids must contain Discord numeric IDs")
+        channel_id = int(raw_channel_id)
+        ensure_channel_allowed(channel_id)
+        result = await search_messages_impl(channel_id, query, limit=limit, scan_limit=500)
+        results.extend(result["messages"])
+
+    results.sort(key=lambda item: item["created_at"], reverse=True)
+    return {
+        "query": query,
+        "count": len(results[:limit]),
+        "messages": results[:limit],
+    }
+
+
+mcp_http_app = mcp.streamable_http_app(
+    stateless_http=True,
+    json_response=True,
+    streamable_http_path="/",
+)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    global discord_task
+    if INVALID_CHANNEL_IDS:
+        print(f"Ignoring invalid DISCORD_ALLOWED_CHANNEL_IDS values: {INVALID_CHANNEL_IDS}")
+
+    async with mcp.session_manager.run():
+        if DISCORD_BOT_TOKEN:
+            discord_task = asyncio.create_task(start_discord_client())
+        try:
+            yield
+        finally:
+            if not discord_client.is_closed():
+                await discord_client.close()
+            if discord_task and not discord_task.done():
+                discord_task.cancel()
+
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -223,12 +424,13 @@ p{{line-height:1.8}}
 <div class="card">
 <span class="ok">{badge}</span>
 <h1>{APP_NAME}</h1>
-<p>許可したDiscordチャンネルだけを読み取るテスト版です。</p>
+<p>許可したDiscordチャンネルだけを読み取る、ChatGPT向けMCP対応版です。</p>
 <p><b>Version:</b> {APP_VERSION}</p>
 <p><b>UTC:</b> {now}</p>
 <p><b>Discord:</b> {state}</p>
 <p><b>Reader:</b> {reader_state}</p>
 <p><b>Allowed channels:</b> {reader["allowed_channel_count"]}</p>
+<p><b>MCP:</b> {"Configured" if reader["mcp_configured"] else "Not configured"}</p>
 <p><b>Status API:</b> <code>/discord/status</code></p>
 <p><b>Health:</b> <code>/health</code></p>
 </div>
@@ -253,101 +455,49 @@ async def get_discord_status():
     return discord_status()
 
 
+@app.get("/mcp-info")
+async def get_mcp_info(
+    request: Request,
+    _: None = Depends(require_bridge_key),
+):
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "name": "momo Discord Reader",
+        "version": APP_VERSION,
+        "transport": "streamable-http",
+        "server_url": f"{base_url}{MCP_MOUNT_PATH}",
+        "authentication_for_chatgpt": "none (private unguessable endpoint URL)",
+        "warning": "Treat server_url as a secret. Anyone with this URL can call the read-only MCP tools.",
+    }
+
+
 @app.get("/discord/channels")
-async def get_allowed_channels(_: None = Depends(require_bridge_key)):
-    ensure_reader_ready()
-    channels = []
-    for channel_id in sorted(ALLOWED_CHANNEL_IDS):
-        try:
-            channel = await get_allowed_channel(channel_id)
-            channels.append({"ok": True, **serialize_channel(channel)})
-        except HTTPException as exc:
-            channels.append(
-                {
-                    "ok": False,
-                    "id": channel_id,
-                    "status_code": exc.status_code,
-                    "error": exc.detail,
-                }
-            )
-    return {"channels": channels}
+async def get_allowed_channels_rest(_: None = Depends(require_bridge_key)):
+    return await list_allowed_channels()
 
 
 @app.get("/discord/messages/{channel_id}")
-async def get_messages(
+async def get_messages_rest(
     channel_id: int,
     limit: int = Query(default=20, ge=1, le=100),
     before: int | None = Query(default=None, ge=1),
     _: None = Depends(require_bridge_key),
 ):
-    channel = await get_allowed_channel(channel_id)
-    before_object = discord.Object(id=before) if before else None
-
-    try:
-        messages = [
-            serialize_message(message)
-            async for message in channel.history(
-                limit=limit,
-                before=before_object,
-                oldest_first=False,
-            )
-        ]
-    except discord.Forbidden as exc:
-        raise HTTPException(
-            status_code=403,
-            detail="Discord bot lacks permission to read message history",
-        ) from exc
-    except discord.HTTPException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Discord API error: {exc.status}",
-        ) from exc
-
-    return {
-        "channel": serialize_channel(channel),
-        "count": len(messages),
-        "messages": messages,
-    }
+    return await read_messages_impl(channel_id, limit, before, None)
 
 
 @app.get("/discord/search/{channel_id}")
-async def search_messages(
+async def search_messages_rest(
     channel_id: int,
     q: str = Query(min_length=1, max_length=200),
     limit: int = Query(default=20, ge=1, le=50),
     scan_limit: int = Query(default=200, ge=1, le=500),
     _: None = Depends(require_bridge_key),
 ):
-    channel = await get_allowed_channel(channel_id)
-    needle = q.casefold()
-    matches = []
-    scanned = 0
+    return await search_messages_impl(channel_id, q, limit, scan_limit)
 
-    try:
-        async for message in channel.history(limit=scan_limit, oldest_first=False):
-            scanned += 1
-            if needle in message.content.casefold():
-                matches.append(serialize_message(message))
-                if len(matches) >= limit:
-                    break
-    except discord.Forbidden as exc:
-        raise HTTPException(
-            status_code=403,
-            detail="Discord bot lacks permission to read message history",
-        ) from exc
-    except discord.HTTPException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Discord API error: {exc.status}",
-        ) from exc
 
-    return {
-        "channel": serialize_channel(channel),
-        "query": q,
-        "scanned": scanned,
-        "count": len(matches),
-        "messages": matches,
-    }
+app.mount(MCP_MOUNT_PATH, mcp_http_app)
 
 
 if __name__ == "__main__":
