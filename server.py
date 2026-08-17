@@ -10,14 +10,20 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, Field
 import uvicorn
 
-APP_NAME = "momo Bridge Server Discord Reader"
-APP_VERSION = "0.4.0"
+APP_NAME = "momo Bridge"
+APP_VERSION = "0.5.0"
+POSTING_NAME = "momotarou(AI)"
+WRITER_WEBHOOK_NAME = "momo Bridge Writer"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
 DISCORD_ALLOWED_CHANNEL_IDS_RAW = os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS", "").strip()
+DISCORD_ALLOWED_WRITE_CHANNEL_IDS_RAW = os.environ.get(
+    "DISCORD_ALLOWED_WRITE_CHANNEL_IDS", ""
+).strip()
 
 
 def parse_channel_ids(raw: str) -> tuple[set[int], list[str]]:
@@ -35,6 +41,9 @@ def parse_channel_ids(raw: str) -> tuple[set[int], list[str]]:
 
 
 ALLOWED_CHANNEL_IDS, INVALID_CHANNEL_IDS = parse_channel_ids(DISCORD_ALLOWED_CHANNEL_IDS_RAW)
+ALLOWED_WRITE_CHANNEL_IDS, INVALID_WRITE_CHANNEL_IDS = parse_channel_ids(
+    DISCORD_ALLOWED_WRITE_CHANNEL_IDS_RAW
+)
 MCP_ROUTE_TOKEN = (
     hashlib.sha256(BRIDGE_API_KEY.encode("utf-8")).hexdigest()[:32]
     if BRIDGE_API_KEY
@@ -47,13 +56,24 @@ intents.guilds = True
 
 discord_client = discord.Client(intents=intents)
 discord_task: asyncio.Task | None = None
+writer_webhook_cache: dict[int, discord.Webhook] = {}
 
-mcp = MCPServer("momo Discord Reader")
+mcp = MCPServer("momo Bridge")
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
 )
+WRITE_CREATE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+)
+
+
+class SendMessageRequest(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=30)
+    content: str = Field(min_length=1, max_length=2000)
 
 
 @discord_client.event
@@ -62,7 +82,9 @@ async def on_ready():
         f"Discord connected as {discord_client.user} "
         f"({discord_client.user.id if discord_client.user else 'unknown'})"
     )
-    print(f"Discord Reader allowlist contains {len(ALLOWED_CHANNEL_IDS)} channel(s).")
+    print(f"Discord read allowlist contains {len(ALLOWED_CHANNEL_IDS)} channel(s).")
+    print(f"Discord write allowlist contains {len(ALLOWED_WRITE_CHANNEL_IDS)} channel(s).")
+    print(f"Discord posting name: {POSTING_NAME}")
     if BRIDGE_API_KEY:
         print("MCP endpoint configured with a private derived route token.")
 
@@ -92,6 +114,12 @@ def discord_status() -> dict:
             "allowlist_valid": not INVALID_CHANNEL_IDS,
             "mcp_configured": bool(BRIDGE_API_KEY),
         },
+        "writer": {
+            "allowed_channel_count": len(ALLOWED_WRITE_CHANNEL_IDS),
+            "allowlist_valid": not INVALID_WRITE_CHANNEL_IDS,
+            "posting_name": POSTING_NAME,
+            "manage_webhooks_required": True,
+        },
     }
 
 
@@ -106,11 +134,15 @@ async def require_bridge_key(
         raise HTTPException(status_code=403, detail="Invalid bridge API key")
 
 
-def ensure_reader_ready() -> None:
+def ensure_discord_ready() -> None:
     if not DISCORD_BOT_TOKEN:
         raise HTTPException(status_code=503, detail="DISCORD_BOT_TOKEN is not configured")
     if not discord_client.is_ready():
         raise HTTPException(status_code=503, detail="Discord client is not connected")
+
+
+def ensure_reader_ready() -> None:
+    ensure_discord_ready()
     if not ALLOWED_CHANNEL_IDS:
         raise HTTPException(
             status_code=503,
@@ -118,15 +150,26 @@ def ensure_reader_ready() -> None:
         )
 
 
+def ensure_writer_ready() -> None:
+    ensure_discord_ready()
+    if not ALLOWED_WRITE_CHANNEL_IDS:
+        raise HTTPException(
+            status_code=503,
+            detail="DISCORD_ALLOWED_WRITE_CHANNEL_IDS is not configured",
+        )
+
+
 def ensure_channel_allowed(channel_id: int) -> None:
     if channel_id not in ALLOWED_CHANNEL_IDS:
-        raise HTTPException(status_code=403, detail="Channel is not in the allowlist")
+        raise HTTPException(status_code=403, detail="Channel is not in the read allowlist")
 
 
-async def get_allowed_channel(channel_id: int):
-    ensure_reader_ready()
-    ensure_channel_allowed(channel_id)
+def ensure_write_channel_allowed(channel_id: int) -> None:
+    if channel_id not in ALLOWED_WRITE_CHANNEL_IDS:
+        raise HTTPException(status_code=403, detail="Channel is not in the write allowlist")
 
+
+async def fetch_discord_channel(channel_id: int):
     channel = discord_client.get_channel(channel_id)
     if channel is None:
         try:
@@ -143,9 +186,27 @@ async def get_allowed_channel(channel_id: int):
                 status_code=502,
                 detail=f"Discord API error: {exc.status}",
             ) from exc
+    return channel
 
+
+async def get_allowed_channel(channel_id: int):
+    ensure_reader_ready()
+    ensure_channel_allowed(channel_id)
+    channel = await fetch_discord_channel(channel_id)
     if not hasattr(channel, "history"):
         raise HTTPException(status_code=400, detail="Channel does not support message history")
+    return channel
+
+
+async def get_write_channel(channel_id: int) -> discord.TextChannel:
+    ensure_writer_ready()
+    ensure_write_channel_allowed(channel_id)
+    channel = await fetch_discord_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        raise HTTPException(
+            status_code=400,
+            detail="v0.5 posting supports Discord text channels only",
+        )
     return channel
 
 
@@ -262,15 +323,109 @@ async def search_messages_impl(
     }
 
 
+async def get_writer_webhook(channel: discord.TextChannel) -> discord.Webhook:
+    cached = writer_webhook_cache.get(channel.id)
+    if cached is not None and cached.token:
+        return cached
+
+    try:
+        webhooks = await channel.webhooks()
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot needs Manage Webhooks permission in this channel",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error while listing webhooks: {exc.status}",
+        ) from exc
+
+    bot_user = discord_client.user
+    for webhook in webhooks:
+        created_by_this_bot = (
+            webhook.user is not None
+            and bot_user is not None
+            and webhook.user.id == bot_user.id
+        )
+        if webhook.name == WRITER_WEBHOOK_NAME and created_by_this_bot and webhook.token:
+            writer_webhook_cache[channel.id] = webhook
+            return webhook
+
+    try:
+        webhook = await channel.create_webhook(
+            name=WRITER_WEBHOOK_NAME,
+            reason="momo Bridge v0.5 posting webhook",
+        )
+    except discord.Forbidden as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Discord bot needs Manage Webhooks permission to create the posting webhook",
+        ) from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord API error while creating webhook: {exc.status}",
+        ) from exc
+
+    if not webhook.token:
+        raise HTTPException(status_code=502, detail="Created Discord webhook has no execution token")
+
+    writer_webhook_cache[channel.id] = webhook
+    return webhook
+
+
+async def send_message_impl(channel_id: int, content: str) -> dict:
+    if not content or not content.strip():
+        raise HTTPException(status_code=400, detail="Message content cannot be empty")
+    if len(content) > 2000:
+        raise HTTPException(status_code=400, detail="Message content must be 2000 characters or fewer")
+
+    channel = await get_write_channel(channel_id)
+    webhook = await get_writer_webhook(channel)
+
+    try:
+        message = await webhook.send(
+            content,
+            username=POSTING_NAME,
+            allowed_mentions=discord.AllowedMentions.none(),
+            wait=True,
+        )
+    except discord.Forbidden as exc:
+        writer_webhook_cache.pop(channel.id, None)
+        raise HTTPException(
+            status_code=403,
+            detail="Discord refused webhook execution",
+        ) from exc
+    except discord.NotFound as exc:
+        writer_webhook_cache.pop(channel.id, None)
+        raise HTTPException(
+            status_code=502,
+            detail="Discord posting webhook was not found; retry to recreate it",
+        ) from exc
+    except (discord.HTTPException, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Discord webhook send failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    return {
+        "ok": True,
+        "posting_name": POSTING_NAME,
+        "channel": serialize_channel(channel),
+        "message": serialize_message(message),
+    }
+
+
 @mcp.tool(annotations=READ_ONLY)
 async def discord_status_tool() -> dict:
-    """Verify Discord connectivity and show Reader configuration status without exposing secrets."""
+    """Verify Discord connectivity and show momo Bridge read/write configuration without exposing secrets."""
     return discord_status()
 
 
 @mcp.tool(annotations=READ_ONLY)
 async def list_allowed_channels() -> dict:
-    """List only the Discord channels explicitly allowlisted for this Reader."""
+    """List only the Discord channels explicitly allowlisted for reading."""
     ensure_reader_ready()
     channels = []
     for channel_id in sorted(ALLOWED_CHANNEL_IDS):
@@ -296,7 +451,7 @@ async def read_channel_messages(
     before: str | None = None,
     after: str | None = None,
 ) -> dict:
-    """Read recent message history from one allowlisted Discord channel. Newest messages are returned first."""
+    """Read recent message history from one read-allowlisted Discord channel. Newest messages are returned first."""
     if not channel_id.isdigit():
         raise ValueError("channel_id must be a Discord numeric ID")
     if limit < 1 or limit > 100:
@@ -312,7 +467,7 @@ async def read_channel_messages(
 
 @mcp.tool(annotations=READ_ONLY)
 async def get_discord_message(channel_id: str, message_id: str) -> dict:
-    """Fetch one Discord message by ID from an allowlisted channel."""
+    """Fetch one Discord message by ID from a read-allowlisted channel."""
     if not channel_id.isdigit() or not message_id.isdigit():
         raise ValueError("channel_id and message_id must be Discord numeric IDs")
     channel = await get_allowed_channel(int(channel_id))
@@ -333,7 +488,7 @@ async def search_discord_messages(
     channel_ids: list[str] | None = None,
     limit: int = 25,
 ) -> dict:
-    """Search message content only within allowlisted Discord channels."""
+    """Search message content only within read-allowlisted Discord channels."""
     if not query or len(query) > 200:
         raise ValueError("query must contain 1 to 200 characters")
     if limit < 1 or limit > 25:
@@ -357,6 +512,18 @@ async def search_discord_messages(
     }
 
 
+@mcp.tool(annotations=WRITE_CREATE)
+async def send_discord_message(channel_id: str, content: str) -> dict:
+    """Create one new plain-text Discord message as momotarou(AI) in a write-allowlisted text channel. Mentions are disabled."""
+    if not channel_id.isdigit():
+        raise ValueError("channel_id must be a Discord numeric ID")
+    if not content or not content.strip():
+        raise ValueError("content cannot be empty")
+    if len(content) > 2000:
+        raise ValueError("content must be 2000 characters or fewer")
+    return await send_message_impl(int(channel_id), content)
+
+
 mcp_http_app = mcp.streamable_http_app(
     stateless_http=True,
     json_response=True,
@@ -369,6 +536,11 @@ async def lifespan(app: FastAPI):
     global discord_task
     if INVALID_CHANNEL_IDS:
         print(f"Ignoring invalid DISCORD_ALLOWED_CHANNEL_IDS values: {INVALID_CHANNEL_IDS}")
+    if INVALID_WRITE_CHANNEL_IDS:
+        print(
+            "Ignoring invalid DISCORD_ALLOWED_WRITE_CHANNEL_IDS values: "
+            f"{INVALID_WRITE_CHANNEL_IDS}"
+        )
 
     async with mcp.session_manager.run():
         if DISCORD_BOT_TOKEN:
@@ -395,11 +567,17 @@ async def home():
         else ("Configured / connecting" if status["configured"] else "Token not set")
     )
     reader = status["reader"]
+    writer = status["writer"]
     reader_state = (
         "Ready"
         if status["connected"]
         and reader["api_key_configured"]
         and reader["allowed_channel_count"] > 0
+        else "Setup required"
+    )
+    writer_state = (
+        "Ready"
+        if status["connected"] and writer["allowed_channel_count"] > 0
         else "Setup required"
     )
     badge = "● Discord OK" if status["connected"] else "● Server OK"
@@ -424,12 +602,13 @@ p{{line-height:1.8}}
 <div class="card">
 <span class="ok">{badge}</span>
 <h1>{APP_NAME}</h1>
-<p>許可したDiscordチャンネルだけを読み取る、ChatGPT向けMCP対応版です。</p>
+<p>許可したDiscordチャンネルを読み取り、許可したチャンネルへ momotarou(AI) 名義で投稿するMCP対応版です。</p>
 <p><b>Version:</b> {APP_VERSION}</p>
 <p><b>UTC:</b> {now}</p>
 <p><b>Discord:</b> {state}</p>
-<p><b>Reader:</b> {reader_state}</p>
-<p><b>Allowed channels:</b> {reader["allowed_channel_count"]}</p>
+<p><b>Reader:</b> {reader_state} ({reader["allowed_channel_count"]} channels)</p>
+<p><b>Writer:</b> {writer_state} ({writer["allowed_channel_count"]} channels)</p>
+<p><b>Posting name:</b> {POSTING_NAME}</p>
 <p><b>MCP:</b> {"Configured" if reader["mcp_configured"] else "Not configured"}</p>
 <p><b>Status API:</b> <code>/discord/status</code></p>
 <p><b>Health:</b> <code>/health</code></p>
@@ -462,12 +641,12 @@ async def get_mcp_info(
 ):
     base_url = str(request.base_url).rstrip("/")
     return {
-        "name": "momo Discord Reader",
+        "name": "momo Bridge",
         "version": APP_VERSION,
         "transport": "streamable-http",
         "server_url": f"{base_url}{MCP_MOUNT_PATH}",
         "authentication_for_chatgpt": "none (private unguessable endpoint URL)",
-        "warning": "Treat server_url as a secret. Anyone with this URL can call the read-only MCP tools.",
+        "warning": "Treat server_url as a secret. Anyone with this URL can call the configured read/write MCP tools.",
     }
 
 
@@ -495,6 +674,16 @@ async def search_messages_rest(
     _: None = Depends(require_bridge_key),
 ):
     return await search_messages_impl(channel_id, q, limit, scan_limit)
+
+
+@app.post("/discord/send")
+async def send_message_rest(
+    body: SendMessageRequest,
+    _: None = Depends(require_bridge_key),
+):
+    if not body.channel_id.isdigit():
+        raise HTTPException(status_code=400, detail="channel_id must be a Discord numeric ID")
+    return await send_message_impl(int(body.channel_id), body.content)
 
 
 app.mount(MCP_MOUNT_PATH, mcp_http_app)
