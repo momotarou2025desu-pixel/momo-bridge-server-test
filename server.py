@@ -9,14 +9,16 @@ import discord
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 import uvicorn
 
-APP_NAME = "momo Bridge"
-APP_VERSION = "0.5.1"
+APP_NAME = "momotarou Bridge"
+APP_VERSION = "0.5.2"
 POSTING_NAME = "momotarou(AI)"
-WRITER_WEBHOOK_NAME = "momo Bridge Writer"
+WRITER_WEBHOOK_NAME = "momotarou Bridge Writer"
+MCP_PUBLIC_HOST = "momo-bridge-server-test.onrender.com"
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
@@ -59,7 +61,7 @@ discord_client = discord.Client(intents=intents)
 discord_task: asyncio.Task | None = None
 writer_webhook_cache: dict[int, discord.Webhook] = {}
 
-mcp = MCPServer("momo Bridge")
+mcp = MCPServer("momotarou Bridge")
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -360,7 +362,7 @@ async def get_writer_webhook(channel: discord.TextChannel) -> discord.Webhook:
     try:
         webhook = await channel.create_webhook(
             name=WRITER_WEBHOOK_NAME,
-            reason="momo Bridge v0.5 posting webhook",
+            reason="momotarou Bridge v0.5 posting webhook",
         )
     except discord.Forbidden as exc:
         raise HTTPException(
@@ -424,7 +426,7 @@ async def send_message_impl(channel_id: int, content: str) -> dict:
 
 @mcp.tool(annotations=READ_ONLY)
 async def discord_status_tool() -> dict:
-    """Verify Discord connectivity and show momo Bridge read/write configuration without exposing secrets."""
+    """Verify Discord connectivity and show momotarou Bridge read/write configuration without exposing secrets."""
     return discord_status()
 
 
@@ -533,6 +535,21 @@ mcp_http_app = mcp.streamable_http_app(
     stateless_http=True,
     json_response=True,
     streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            MCP_PUBLIC_HOST,
+            f"{MCP_PUBLIC_HOST}:*",
+            "127.0.0.1:*",
+            "localhost:*",
+        ],
+        allowed_origins=[
+            "https://chatgpt.com",
+            "https://chat.openai.com",
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+        ],
+    ),
 )
 
 
@@ -646,10 +663,10 @@ async def get_mcp_info(
 ):
     base_url = str(request.base_url).rstrip("/")
     return {
-        "name": "momo Bridge",
+        "name": "momotarou Bridge",
         "version": APP_VERSION,
         "transport": "streamable-http",
-        "server_url": f"{base_url}{MCP_MOUNT_PATH}",
+        "server_url": f"{base_url}{MCP_MOUNT_PATH}/",
         "authentication_for_chatgpt": "none (private unguessable endpoint URL)",
         "warning": "Treat server_url as a secret. Anyone with this URL can call the configured read/write MCP tools.",
     }
