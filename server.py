@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 APP_NAME = "momo Bridge"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 POSTING_NAME = "momotarou(AI)"
 WRITER_WEBHOOK_NAME = "momo Bridge Writer"
 
@@ -22,7 +22,8 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
 DISCORD_ALLOWED_CHANNEL_IDS_RAW = os.environ.get("DISCORD_ALLOWED_CHANNEL_IDS", "").strip()
 DISCORD_ALLOWED_WRITE_CHANNEL_IDS_RAW = os.environ.get(
-    "DISCORD_ALLOWED_WRITE_CHANNEL_IDS", ""
+    "DISCORD_ALLOWED_WRITE_CHANNEL_IDS",
+    DISCORD_ALLOWED_CHANNEL_IDS_RAW,
 ).strip()
 
 
@@ -102,6 +103,9 @@ async def start_discord_client():
 
 def discord_status() -> dict:
     user = discord_client.user
+    write_allowlist_inherited = not bool(
+        os.environ.get("DISCORD_ALLOWED_WRITE_CHANNEL_IDS", "").strip()
+    )
     return {
         "configured": bool(DISCORD_BOT_TOKEN),
         "connected": discord_client.is_ready(),
@@ -117,6 +121,7 @@ def discord_status() -> dict:
         "writer": {
             "allowed_channel_count": len(ALLOWED_WRITE_CHANNEL_IDS),
             "allowlist_valid": not INVALID_WRITE_CHANNEL_IDS,
+            "allowlist_source": "read_allowlist" if write_allowlist_inherited else "write_allowlist",
             "posting_name": POSTING_NAME,
             "manage_webhooks_required": True,
         },
@@ -155,7 +160,7 @@ def ensure_writer_ready() -> None:
     if not ALLOWED_WRITE_CHANNEL_IDS:
         raise HTTPException(
             status_code=503,
-            detail="DISCORD_ALLOWED_WRITE_CHANNEL_IDS is not configured",
+            detail="No Discord channels are configured for writing",
         )
 
 
